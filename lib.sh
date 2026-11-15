@@ -7,17 +7,23 @@ init_job() {
   JOB_DIR="$BASE_DIR/jobs/$JOB_ID"
   mkdir -p "$JOB_DIR"; chmod 700 "$BASE_DIR/jobs" "$JOB_DIR"
   LOG="$JOB_DIR/job.log"; : > "$LOG"; chmod 600 "$LOG"
-  SSH_BASE="-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$JOB_DIR/known_hosts -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ConnectTimeout=15 -o LogLevel=ERROR"
+  SSH_BASE="-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$JOB_DIR/known_hosts -o ServerAliveInterval=15 -o ServerAliveCountMax=20 -o ConnectTimeout=15 -o LogLevel=ERROR"
 }
 
 log() { echo "[$(date +%T)] $*" | tee -a "$LOG"; }
 
+_cm() { echo "/tmp/cm-$JOB_ID-$1"; }
+
+# открыть постоянное (мастер) соединение
+open_master() {
+  SSHPASS="${PASS[$1]}" sshpass -e ssh $SSH_BASE -o PubkeyAuthentication=no \
+    -o ControlMaster=yes -o ControlPath="$(_cm $1)" -o ControlPersist=2h \
+    -p "${PORT[$1]}" -fN "root@${HOST[$1]}" 2>"$JOB_DIR/conn$1.err"
+}
+
 connect() {
   local n=$1 rc
-  SSHPASS="${PASS[$n]}" sshpass -e ssh $SSH_BASE -o PubkeyAuthentication=no \
-    -o ControlMaster=yes -o ControlPath="/tmp/cm-$JOB_ID-$n" -o ControlPersist=2h \
-    -p "${PORT[$n]}" -fN "root@${HOST[$n]}" 2>"$JOB_DIR/conn$n.err"
-  rc=$?
+  open_master $n; rc=$?
   if [ $rc -ne 0 ]; then
     case $rc in
       5) log "Сервер $n: пароль не принят" ;;
@@ -29,17 +35,41 @@ connect() {
   r "$n" true && log "Сервер $n (${HOST[$n]}): подключено"
 }
 
-# выполнить команду на сервере n
-r()  { local n=$1; shift; ssh -n $SSH_BASE -o ControlPath="/tmp/cm-$JOB_ID-$n" -p "${PORT[$n]}" "root@${HOST[$n]}" "unset HISTFILE; $*"; }
+alive() { ssh -O check -o ControlPath="$(_cm $1)" -p "${PORT[$1]}" "root@${HOST[$1]}" >/dev/null 2>&1; }
+
+# если постоянное соединение умерло, пересоздать его (до 6 попыток). В вывод ничего не печатает, только в журнал
+ensure() {
+  local n=$1 i
+  alive $n && return 0
+  echo "[$(date +%T)] Сервер $n: соединение потеряно, восстанавливаю" >> "$LOG"
+  for i in 1 2 3 4 5 6; do
+    rm -f "$(_cm $n)"
+    if open_master $n; then echo "[$(date +%T)] Сервер $n: соединение восстановлено" >> "$LOG"; return 0; fi
+    sleep 10
+  done
+  echo "[$(date +%T)] Сервер $n: восстановить соединение не удалось" >> "$LOG"
+  return 1
+}
+
+# выполнить команду на сервере n (никогда не спрашивает пароль у терминала: BatchMode)
+r() {
+  local n=$1 rc; shift
+  ensure $n || return 255
+  ssh -n $SSH_BASE -o BatchMode=yes -o ControlPath="$(_cm $n)" -p "${PORT[$n]}" "root@${HOST[$n]}" "unset HISTFILE; $*"; rc=$?
+  if [ $rc = 255 ] && ensure $n; then
+    ssh -n $SSH_BASE -o BatchMode=yes -o ControlPath="$(_cm $n)" -p "${PORT[$n]}" "root@${HOST[$n]}" "unset HISTFILE; $*"; rc=$?
+  fi
+  return $rc
+}
 # выполнить скрипт со стандартного ввода на сервере n
-rs() { local n=$1; ssh $SSH_BASE -o ControlPath="/tmp/cm-$JOB_ID-$n" -p "${PORT[$n]}" "root@${HOST[$n]}" 'unset HISTFILE; bash -s'; }
+rs() { local n=$1; ensure $n || return 255; ssh $SSH_BASE -o BatchMode=yes -o ControlPath="$(_cm $n)" -p "${PORT[$n]}" "root@${HOST[$n]}" 'unset HISTFILE; bash -s'; }
 # положить файл на сервер: put N локальный_файл удалённый_путь
-put() { local n=$1 src=$2 dst=$3; ssh $SSH_BASE -o ControlPath="/tmp/cm-$JOB_ID-$n" -p "${PORT[$n]}" "root@${HOST[$n]}" "cat > $dst" < "$src"; }
+put() { local n=$1 src=$2 dst=$3; ensure $n || return 255; ssh $SSH_BASE -o BatchMode=yes -o ControlPath="$(_cm $n)" -p "${PORT[$n]}" "root@${HOST[$n]}" "cat > $dst" < "$src"; }
 # открыт ли TCP-порт с сервера n: tcp N адрес порт
 tcp() { r "$1" "timeout 6 bash -c '</dev/tcp/$2/$3' 2>/dev/null && echo open || echo closed"; }
 
 disconnect() {
-  for n in 1 2; do ssh -O exit -o ControlPath="/tmp/cm-$JOB_ID-$n" "root@${HOST[$n]}" 2>/dev/null; done
+  for n in 1 2; do ssh -O exit -o ControlPath="$(_cm $n)" "root@${HOST[$n]}" 2>/dev/null; done
 }
 
 # код страны по IP (две заглавные буквы или пусто)

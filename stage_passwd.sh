@@ -4,7 +4,8 @@ declare -A NEWPW PWSTATE
 gen_pass() { openssl rand -base64 36 | tr -d '/+=\n' | cut -c1-24; }
 
 set_pass() {
-  printf 'root:%s\n' "$2" | ssh $SSH_BASE -o ControlPath="/tmp/cm-$JOB_ID-$1" -p "${PORT[$1]}" "root@${HOST[$1]}" 'chpasswd'
+  ensure "$1" || return 1
+  printf 'root:%s\n' "$2" | ssh $SSH_BASE -o BatchMode=yes -o ControlPath="$(_cm $1)" -p "${PORT[$1]}" "root@${HOST[$1]}" 'chpasswd'
 }
 
 check_pass() {
@@ -48,6 +49,7 @@ stage_passwd() {
     PWSTATE[$n]="проверен"
     if [ -z "$(check_pass $n "${PASS[$n]}")" ]; then log "Сервер $n: новый пароль принят, старый больше не работает: PASS"
     else log "Сервер $n: новый пароль принят, но старый тоже принимается (проверьте настройки): ВНИМАНИЕ"; fi
+    PASS[$n]="${NEWPW[$n]}"
   done
   log "Пароли обоих серверов сменены и проверены"
 }
